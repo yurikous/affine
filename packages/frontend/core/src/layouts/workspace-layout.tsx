@@ -1,0 +1,273 @@
+import { assertExists } from '@blocksuite/global/utils';
+import {
+  DndContext,
+  DragOverlay,
+  MouseSensor,
+  useDndContext,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import {
+  DocsService,
+  GlobalContextService,
+  useLiveData,
+  useService,
+  WorkspaceService,
+} from '@toeverything/infra';
+import { useAtomValue, useSetAtom } from 'jotai';
+import type { PropsWithChildren, ReactNode } from 'react';
+import { lazy, useCallback, useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Map as YMap } from 'yjs';
+
+import { openSettingModalAtom } from '../atoms';
+import { WorkspaceAIOnboarding } from '../components/affine/ai-onboarding';
+import { AppContainer } from '../components/affine/app-container';
+import { SyncAwareness } from '../components/affine/awareness';
+import { appSidebarResizingAtom } from '../components/app-sidebar';
+import { usePageHelper } from '../components/blocksuite/block-suite-page-list/utils';
+import type { DraggableTitleCellData } from '../components/page-list';
+import { RootAppSidebar } from '../components/root-app-sidebar';
+import { MainContainer } from '../components/workspace';
+import { WorkspaceUpgrade } from '../components/workspace-upgrade';
+import { useAppSettingHelper } from '../hooks/affine/use-app-setting-helper';
+import {
+  resolveDragEndIntent,
+  useGlobalDNDHelper,
+} from '../hooks/affine/use-global-dnd-helper';
+import { useRegisterFindInPageCommands } from '../hooks/affine/use-register-find-in-page-commands';
+import { useNavigateHelper } from '../hooks/use-navigate-helper';
+import { useRegisterWorkspaceCommands } from '../hooks/use-register-workspace-commands';
+import { QuickSearchService } from '../modules/cmdk';
+import { useRegisterNavigationCommands } from '../modules/navigation/view/use-register-navigation-commands';
+import { WorkbenchService } from '../modules/workbench';
+import {
+  AllWorkspaceModals,
+  CurrentWorkspaceModals,
+} from '../providers/modal-provider';
+import { SWRConfigProvider } from '../providers/swr-config-provider';
+import { pathGenerator } from '../shared';
+import { mixpanel } from '../utils';
+import * as styles from './styles.css';
+
+const CMDKQuickSearchModal = lazy(() =>
+  import('../modules/cmdk/views').then(module => ({
+    default: module.CMDKQuickSearchModal,
+  }))
+);
+
+export const QuickSearch = () => {
+  const quickSearch = useService(QuickSearchService).quickSearch;
+  const open = useLiveData(quickSearch.show$);
+
+  const onToggleQuickSearch = useCallback(
+    (open: boolean) => {
+      if (open) {
+        // should never be here
+        quickSearch.show();
+      } else {
+        quickSearch.hide();
+      }
+    },
+    [quickSearch]
+  );
+
+  const docRecordList = useService(DocsService).list;
+  const currentDocId = useLiveData(
+    useService(GlobalContextService).globalContext.docId.$
+  );
+  const currentPage = useLiveData(
+    currentDocId ? docRecordList.doc$(currentDocId) : null
+  );
+  const pageMeta = useLiveData(currentPage?.meta$);
+
+  return (
+    <CMDKQuickSearchModal
+      open={open}
+      onOpenChange={onToggleQuickSearch}
+      pageMeta={pageMeta}
+    />
+  );
+};
+
+export const WorkspaceLayout = function WorkspaceLayout({
+  children,
+}: PropsWithChildren) {
+  return (
+    <SWRConfigProvider>
+      {/* load all workspaces is costly, do not block the whole UI */}
+      <AllWorkspaceModals />
+      <CurrentWorkspaceModals />
+      <WorkspaceLayoutInner>{children}</WorkspaceLayoutInner>
+      {/* should show after workspace loaded */}
+      <WorkspaceAIOnboarding />
+    </SWRConfigProvider>
+  );
+};
+
+export const WorkspaceLayoutInner = ({ children }: PropsWithChildren) => {
+  const currentWorkspace = useService(WorkspaceService).workspace;
+  const { openPage } = useNavigateHelper();
+  const pageHelper = usePageHelper(currentWorkspace.docCollection);
+
+  const upgrading = useLiveData(currentWorkspace.upgrade.upgrading$);
+  const needUpgrade = useLiveData(currentWorkspace.upgrade.needUpgrade$);
+
+  const workbench = useService(WorkbenchService).workbench;
+
+  const basename = useLiveData(workbench.basename$);
+
+  const currentPath = useLiveData(
+    workbench.location$.map(location => basename + location.pathname)
+  );
+
+  useRegisterWorkspaceCommands();
+  useRegisterNavigationCommands();
+  useRegisterFindInPageCommands();
+
+  useEffect(() => {
+    // hotfix for blockVersions
+    // this is a mistake in the
+    //    0.8.0 ~ 0.8.1
+    //    0.8.0-beta.0 ~ 0.8.0-beta.3
+    //    0.8.0-canary.17 ~ 0.9.0-canary.3
+    const meta = currentWorkspace.docCollection.doc.getMap('meta');
+    const blockVersions = meta.get('blockVersions');
+    if (
+      !(blockVersions instanceof YMap) &&
+      blockVersions !== null &&
+      blockVersions !== undefined &&
+      typeof blockVersions === 'object'
+    ) {
+      meta.set(
+        'blockVersions',
+        new YMap(Object.entries(blockVersions as Record<string, number>))
+      );
+    }
+  }, [currentWorkspace.docCollection.doc]);
+
+  const handleCreatePage = useCallback(() => {
+    return pageHelper.createPage();
+  }, [pageHelper]);
+
+  const quickSearch = useService(QuickSearchService).quickSearch;
+  const handleOpenQuickSearchModal = useCallback(() => {
+    quickSearch.show();
+    mixpanel.track('QuickSearchOpened', {
+      segment: 'navigation panel',
+      control: 'search button',
+    });
+  }, [quickSearch]);
+
+  const setOpenSettingModalAtom = useSetAtom(openSettingModalAtom);
+
+  const handleOpenSettingModal = useCallback(() => {
+    setOpenSettingModalAtom({
+      activeTab: 'appearance',
+      open: true,
+    });
+    mixpanel.track('SettingsViewed', {
+      // page:
+      segment: 'navigation panel',
+      module: 'general list',
+      control: 'settings button',
+    });
+  }, [setOpenSettingModalAtom]);
+
+  const resizing = useAtomValue(appSidebarResizingAtom);
+
+  const sensors = useSensors(
+    useSensor(
+      MouseSensor,
+      useMemo(
+        /* useMemo is necessary to avoid re-render */
+        () => ({
+          activationConstraint: {
+            distance: 10,
+          },
+        }),
+        []
+      )
+    )
+  );
+
+  const { handleDragEnd } = useGlobalDNDHelper();
+  const { appSettings } = useAppSettingHelper();
+
+  return (
+    <>
+      {/* This DndContext is used for drag page from all-pages list into a folder in sidebar */}
+      <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+        <AppContainer data-current-path={currentPath} resizing={resizing}>
+          <RootAppSidebar
+            isPublicWorkspace={false}
+            onOpenQuickSearchModal={handleOpenQuickSearchModal}
+            onOpenSettingModal={handleOpenSettingModal}
+            currentWorkspace={currentWorkspace}
+            openPage={useCallback(
+              (pageId: string) => {
+                assertExists(currentWorkspace);
+                return openPage(currentWorkspace.id, pageId);
+              },
+              [currentWorkspace, openPage]
+            )}
+            createPage={handleCreatePage}
+            paths={pathGenerator}
+          />
+          <MainContainer clientBorder={appSettings.clientBorder}>
+            {needUpgrade || upgrading ? <WorkspaceUpgrade /> : children}
+          </MainContainer>
+        </AppContainer>
+        <GlobalDragOverlay />
+      </DndContext>
+      <QuickSearch />
+      <SyncAwareness />
+    </>
+  );
+};
+
+function GlobalDragOverlay() {
+  const { active, over } = useDndContext();
+  const [preview, setPreview] = useState<ReactNode>();
+
+  useEffect(() => {
+    if (active) {
+      const data = active.data.current as DraggableTitleCellData;
+      setPreview(data.preview);
+    }
+    // do not update content since it may disappear because of virtual rendering
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.id]);
+
+  const intent = resolveDragEndIntent(active, over);
+
+  const overDropZone =
+    intent === 'pin:add' ||
+    intent === 'collection:add' ||
+    intent === 'trash:move-to';
+
+  const accent =
+    intent === 'pin:remove'
+      ? 'warning'
+      : intent === 'trash:move-to'
+        ? 'error'
+        : 'normal';
+
+  const sorting = intent === 'pin:reorder';
+
+  return createPortal(
+    <DragOverlay adjustScale={false} dropAnimation={null}>
+      {preview ? (
+        <div
+          data-over-drop={overDropZone}
+          data-sorting={sorting}
+          data-accent={accent}
+          className={styles.dragOverlay}
+        >
+          {preview}
+        </div>
+      ) : null}
+    </DragOverlay>,
+    document.body
+  );
+}
